@@ -122,7 +122,15 @@ def main() -> int:
         return 1
     print(f"发现 {len(targets)} 个容器: {targets}")
 
-    task_names = [t.strip() for t in args.task.split(",") if t.strip()]
+    if args.task.strip().upper() == "ALL":
+        # 用第一个容器的 client 拉 GUI-only 任务列表（默认排除 mcp / user-interaction）
+        first_url, _ = targets[0]
+        probe = AndroidEnvClient(first_url, device="emulator-5554", step_wait_time=1.0)
+        probe.switch_suite_family("mobile_world")
+        task_names = probe.get_suite_task_list(enable_mcp=False, enable_user_interaction=False)
+        print(f"GUI-only 任务共 {len(task_names)} 题")
+    else:
+        task_names = [t.strip() for t in args.task.split(",") if t.strip()]
     pairs = [(targets[i % len(targets)], t) for i, t in enumerate(task_names)]
     if not pairs:
         print("未解析到任何任务名（--task 为空或仅逗号）", file=sys.stderr)
