@@ -17,7 +17,7 @@ API key 一律通过环境变量传入（ANTHROPIC_API_KEY / MIDSCENE_MODEL_API_
 from __future__ import annotations
 
 import argparse
-import json
+import os
 import subprocess
 import sys
 import time
@@ -61,7 +61,9 @@ def run_one_task(target: tuple[str, int], task_name: str, args: argparse.Namespa
         env.initialize_task(task_name)
         goal = env.get_task_goal(task_name)
 
-        subprocess.run(["adb", "connect", f"localhost:{adb_port}"], capture_output=True, text=True, check=False)
+        adb = subprocess.run(["adb", "connect", f"localhost:{adb_port}"], capture_output=True, text=True, check=False)
+        if adb.returncode != 0:
+            print(f"[adb] connect failed rc={adb.returncode}: {adb.stderr.strip()}", file=sys.stderr)
 
         cmd = [
             args.agent_python, AGENT_MAIN,
@@ -72,19 +74,25 @@ def run_one_task(target: tuple[str, int], task_name: str, args: argparse.Namespa
             "--max-turns", str(args.max_turns),
             "--cache", "false",
         ]
-        proc = subprocess.run(
-            cmd,
-            cwd=AGENT_DIR,
-            env=build_agent_env(adb_port),
-            timeout=args.agent_timeout,
-            check=False,
-        )
+        agent_exit: int | str
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=AGENT_DIR,
+                env=build_agent_env(adb_port),
+                timeout=args.agent_timeout,
+                check=False,
+            )
+            agent_exit = proc.returncode
+        except subprocess.TimeoutExpired:
+            print(f"[timeout] agent exceeded {args.agent_timeout}s on {task_name}", file=sys.stderr)
+            agent_exit = "timeout"
         score, reason = env.get_task_score(task_name)
         return {
             "task": task_name,
             "goal": goal,
             "adb_port": adb_port,
-            "agent_exit": proc.returncode,
+            "agent_exit": agent_exit,
             "score": score,
             "success": score_success(score),
             "reason": reason,
@@ -112,12 +120,14 @@ def main() -> int:
     if not targets:
         print("未发现运行中的 MobileWorld 容器，请先 `sudo uv run mw env run --count N`", file=sys.stderr)
         return 1
-    print(f"发现 {len(targets)} 个容器: {[t for t in targets]}")
+    print(f"发现 {len(targets)} 个容器: {targets}")
 
     task_names = [t.strip() for t in args.task.split(",") if t.strip()]
     pairs = [(targets[i % len(targets)], t) for i, t in enumerate(task_names)]
+    if not pairs:
+        print("未解析到任何任务名（--task 为空或仅逗号）", file=sys.stderr)
+        return 1
 
-    import os
     os.makedirs(args.log_dir, exist_ok=True)
     out_path = f"{args.log_dir}/results.jsonl"
 
