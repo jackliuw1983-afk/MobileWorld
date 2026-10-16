@@ -76,13 +76,15 @@ def run_one_task(target: tuple[str, int], task_name: str, args: argparse.Namespa
         ]
         if args.agent_bin and os.path.isfile(args.agent_bin):
             cmd = [args.agent_bin] + agent_argv
+            cwd: str | None = None  # 二进制按自身路径定位 _internal，无需指定 cwd
         else:
             cmd = [args.agent_python, agent_main] + agent_argv
+            cwd = args.agent_dir
         agent_exit: int | str | None
         try:
             proc = subprocess.run(
                 cmd,
-                cwd=args.agent_dir,
+                cwd=cwd,
                 env=build_agent_env(adb_port),
                 timeout=args.agent_timeout,
                 check=False,
