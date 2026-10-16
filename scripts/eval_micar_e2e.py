@@ -66,8 +66,7 @@ def run_one_task(target: tuple[str, int], task_name: str, args: argparse.Namespa
         if adb.returncode != 0:
             print(f"[adb] connect failed rc={adb.returncode}: {adb.stderr.strip()}", file=sys.stderr)
 
-        cmd = [
-            args.agent_python, agent_main,
+        agent_argv = [
             "--mw-goal", goal,
             "--device", f"localhost:{adb_port}",
             "--platform", "android",
@@ -75,6 +74,10 @@ def run_one_task(target: tuple[str, int], task_name: str, args: argparse.Namespa
             "--max-turns", str(args.max_turns),
             "--cache", "false",
         ]
+        if args.agent_bin and os.path.isfile(args.agent_bin):
+            cmd = [args.agent_bin] + agent_argv
+        else:
+            cmd = [args.agent_python, agent_main] + agent_argv
         agent_exit: int | str | None
         try:
             proc = subprocess.run(
@@ -142,8 +145,16 @@ def main() -> int:
         default="python",
         help="agent 侧 python 解释器，须为已安装 agent 依赖的解释器（勿用 MobileWorld venv）",
     )
+    ap.add_argument(
+        "--agent-bin",
+        default=None,
+        help="agent 打包二进制路径（默认取 <agent-dir>/dist/micar-agent-macos-arm64/micar-agent）；存在则优先于 --agent-python 执行",
+    )
     ap.add_argument("--concurrency", type=int, default=1)
     args = ap.parse_args()
+
+    if not args.agent_bin:
+        args.agent_bin = os.path.join(args.agent_dir, "dist", "micar-agent-macos-arm64", "micar-agent")
 
     targets = discover_targets()
     if not targets:
