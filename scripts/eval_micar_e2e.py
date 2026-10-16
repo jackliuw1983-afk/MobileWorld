@@ -3,7 +3,7 @@
 每个容器 env 上：
   1. AndroidEnvClient.initialize_task(task_name) → 触发 initialize_task_hook 布置状态
   2. get_task_goal(task_name)                      → 自然语言 goal
-  3. adb connect localhost:{adb_port}              → 暴露容器内模拟器
+  3. adb connect localhost:{adb_port} + 唤醒/常亮   → 暴露容器内模拟器并防熄屏空截图
   4. 子进程启动真实 agent：main.py --mw-goal "<goal>" --device localhost:{adb_port}
   5. agent 退出后 get_task_score(task_name)        → MobileWorld 唯一打分来源
   6. 结果写 results.jsonl
@@ -51,6 +51,22 @@ def discover_targets(image_filter: str = "mobile_world", prefix: str = "mobile_w
     return targets
 
 
+def wake_and_keep_awake(adb_port: int) -> None:
+    """唤醒并保持屏幕常亮，避免无头模拟器熄屏后 screencap 输出空截图。"""
+    serial = f"localhost:{adb_port}"
+    cmds = (
+        ["shell", "input", "keyevent", "224"],  # KEYCODE_WAKEUP
+        ["shell", "input", "keyevent", "82"],    # KEYCODE_MENU（解锁）
+        ["shell", "settings", "put", "system", "screen_off_timeout", "2147483647"],
+        ["shell", "svc", "power", "stayon", "true"],
+    )
+    for args in cmds:
+        subprocess.run(
+            ["adb", "-s", serial] + args, capture_output=True, text=True, check=False
+        )
+    time.sleep(1)  # 等屏幕真正亮起，再交给 agent 截图
+
+
 def run_one_task(target: tuple[str, int], task_name: str, args: argparse.Namespace) -> dict:
     backend_url, adb_port = target
     agent_main = os.path.join(args.agent_dir, "main.py")
@@ -65,6 +81,7 @@ def run_one_task(target: tuple[str, int], task_name: str, args: argparse.Namespa
         adb = subprocess.run(["adb", "connect", f"localhost:{adb_port}"], capture_output=True, text=True, check=False)
         if adb.returncode != 0:
             print(f"[adb] connect failed rc={adb.returncode}: {adb.stderr.strip()}", file=sys.stderr)
+        wake_and_keep_awake(adb_port)
 
         agent_argv = [
             "--mw-goal", goal,
