@@ -30,7 +30,6 @@ from mobile_world.runtime.utils.docker import docker_inspect, list_containers_by
 from mobile_world.runtime.utils.e2e import build_agent_env, extract_host_port, score_success
 
 AGENT_DIR = "/Users/mi/git/micartest-mobile/micar_app_ui_agent"
-AGENT_MAIN = f"{AGENT_DIR}/main.py"
 
 
 def discover_targets(image_filter: str = "mobile_world", prefix: str = "mobile_world_env") -> list[tuple[str, int]]:
@@ -54,10 +53,12 @@ def discover_targets(image_filter: str = "mobile_world", prefix: str = "mobile_w
 
 def run_one_task(target: tuple[str, int], task_name: str, args: argparse.Namespace) -> dict:
     backend_url, adb_port = target
-    env = AndroidEnvClient(backend_url, device="emulator-5554", step_wait_time=1.0)
-    env.switch_suite_family("mobile_world")
+    agent_main = os.path.join(args.agent_dir, "main.py")
     start = time.time()
+    env: AndroidEnvClient | None = None
     try:
+        env = AndroidEnvClient(backend_url, device="emulator-5554", step_wait_time=1.0)
+        env.switch_suite_family("mobile_world")
         env.initialize_task(task_name)
         goal = env.get_task_goal(task_name)
 
@@ -66,7 +67,7 @@ def run_one_task(target: tuple[str, int], task_name: str, args: argparse.Namespa
             print(f"[adb] connect failed rc={adb.returncode}: {adb.stderr.strip()}", file=sys.stderr)
 
         cmd = [
-            args.agent_python, AGENT_MAIN,
+            args.agent_python, agent_main,
             "--mw-goal", goal,
             "--device", f"localhost:{adb_port}",
             "--platform", "android",
@@ -74,11 +75,11 @@ def run_one_task(target: tuple[str, int], task_name: str, args: argparse.Namespa
             "--max-turns", str(args.max_turns),
             "--cache", "false",
         ]
-        agent_exit: int | str
+        agent_exit: int | str | None
         try:
             proc = subprocess.run(
                 cmd,
-                cwd=AGENT_DIR,
+                cwd=args.agent_dir,
                 env=build_agent_env(adb_port),
                 timeout=args.agent_timeout,
                 check=False,
@@ -98,11 +99,34 @@ def run_one_task(target: tuple[str, int], task_name: str, args: argparse.Namespa
             "reason": reason,
             "duration_seconds": round(time.time() - start, 1),
         }
+    except Exception as e:  # noqa: BLE001
+        print(f"[harness_error] {task_name}: {e}", file=sys.stderr)
+        return {
+            "task": task_name,
+            "goal": "",
+            "adb_port": adb_port,
+            "agent_exit": None,
+            "score": 0.0,
+            "success": False,
+            "reason": f"harness_error: {e}",
+            "duration_seconds": round(time.time() - start, 1),
+        }
     finally:
-        try:
-            env.tear_down_task(task_name)
-        except Exception:  # noqa: BLE001
-            pass
+        if env is not None:
+            try:
+                env.tear_down_task(task_name)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def run_target_group(
+    target: tuple[str, int], task_names: list[str], args: argparse.Namespace
+) -> list[dict]:
+    """串行跑同一容器上的全部任务（同一 env 不可并发），返回结果行列表。
+
+    不写 jsonlines —— 写文件只能发生在主线程。
+    """
+    return [run_one_task(target, name, args) for name in task_names]
 
 
 def main() -> int:
@@ -112,7 +136,12 @@ def main() -> int:
     ap.add_argument("--model", default="xiaomi/mimo-v2.6-flash", help="规划模型")
     ap.add_argument("--max-turns", type=int, default=30)
     ap.add_argument("--agent-timeout", type=int, default=900, help="单个 agent 子进程超时（秒）")
-    ap.add_argument("--agent-python", default="python", help="agent 侧 python 解释器")
+    ap.add_argument("--agent-dir", default=AGENT_DIR, help="agent 代码目录（含 main.py）")
+    ap.add_argument(
+        "--agent-python",
+        default="python",
+        help="agent 侧 python 解释器，须为已安装 agent 依赖的解释器（勿用 MobileWorld venv）",
+    )
     ap.add_argument("--concurrency", type=int, default=1)
     args = ap.parse_args()
 
@@ -131,24 +160,25 @@ def main() -> int:
         print(f"GUI-only 任务共 {len(task_names)} 题")
     else:
         task_names = [t.strip() for t in args.task.split(",") if t.strip()]
-    pairs = [(targets[i % len(targets)], t) for i, t in enumerate(task_names)]
-    if not pairs:
+    task_groups: dict[tuple[str, int], list[str]] = {}
+    for i, name in enumerate(task_names):
+        task_groups.setdefault(targets[i % len(targets)], []).append(name)
+    if not task_groups:
         print("未解析到任何任务名（--task 为空或仅逗号）", file=sys.stderr)
         return 1
 
     os.makedirs(args.log_dir, exist_ok=True)
     out_path = f"{args.log_dir}/results.jsonl"
 
+    # 按目标分组：同一容器内任务串行（一个 worker），跨容器并行；
+    # worker 只返回结果行，jsonlines 写入仅发生在主线程。
     results: list[dict] = []
-    with jsonlines.open(out_path, mode="a") as writer:
-        if len(pairs) == 1:
-            results.append(run_one_task(pairs[0][0], pairs[0][1], args))
-            writer.write(results[-1])
-        else:
-            with ThreadPoolExecutor(max_workers=min(args.concurrency, len(pairs))) as ex:
-                futs = [ex.submit(run_one_task, tgt, name, args) for tgt, name in pairs]
-                for fut in as_completed(futs):
-                    r = fut.result()
+    with jsonlines.open(out_path, mode="w") as writer:
+        max_workers = min(args.concurrency, len(task_groups))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futs = [ex.submit(run_target_group, tgt, names, args) for tgt, names in task_groups.items()]
+            for fut in as_completed(futs):
+                for r in fut.result():
                     results.append(r)
                     writer.write(r)
 

@@ -15,6 +15,12 @@ def test_extract_host_port():
     assert extract_host_port(ports, "9999") is None
 
 
+def test_extract_host_port_exact_match_no_substring_collision():
+    ports = {"6800/tcp": [{"HostPort": "6800"}]}
+    assert extract_host_port(ports, "6800") == "6800"
+    assert extract_host_port(ports, "800") is None
+
+
 def test_score_success():
     assert score_success(1.0) is True
     assert score_success(0.0) is False

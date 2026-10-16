@@ -19,7 +19,7 @@ def extract_host_port(ports: dict, container_port: str) -> str | None:
     ports 形如 {"6800/tcp": [{"HostPort": "6800"}], ...}；container_port 如 "6800"。
     """
     for key, host_bindings in ports.items():
-        if f"{container_port}/tcp" in key and host_bindings:
+        if key.split("/", 1)[0] == container_port and host_bindings:
             host_port = host_bindings[0].get("HostPort", "")
             if host_port:
                 return host_port
