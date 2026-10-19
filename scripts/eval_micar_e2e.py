@@ -6,7 +6,7 @@
   3. adb connect localhost:{adb_port} + 唤醒/常亮   → 暴露容器内模拟器并防熄屏空截图
   4. 子进程启动真实 agent：main.py --mw-goal "<goal>" --device localhost:{adb_port}
   5. agent 退出后 get_task_score(task_name)        → MobileWorld 唯一打分来源
-  6. 结果写 results.jsonl
+  6. 结果写 results.jsonl + 每题 <log-dir>/<task>/result.txt
 
 不经过 BaseAgent / JSONAction / core.runner 的 predict 循环。
 API key 一律通过环境变量传入（ANTHROPIC_API_KEY / MIDSCENE_MODEL_API_KEY），不落盘。
@@ -18,16 +18,18 @@ from __future__ import annotations
 
 import argparse
 import os
+import queue
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import jsonlines
 
 from mobile_world.runtime.client import AndroidEnvClient
 from mobile_world.runtime.utils.docker import docker_inspect, list_containers_by_image_substring
 from mobile_world.runtime.utils.e2e import build_agent_env, extract_host_port, score_success
+from mobile_world.runtime.utils.models import JSONAction
 
 AGENT_DIR = "/Users/mi/git/micartest-mobile/micar_app_ui_agent"
 
@@ -67,6 +69,32 @@ def wake_and_keep_awake(adb_port: int) -> None:
     time.sleep(1)  # 等屏幕真正亮起，再交给 agent 截图
 
 
+_ANSWER_MARKER = "MOBILEWORLD_ANSWER:"
+
+
+def _submit_answer(env: AndroidEnvClient, agent_log_path: str) -> None:
+    """从 agent 日志提取 MOBILEWORLD_ANSWER 标记，回传给 MobileWorld（ANSWER 动作）。
+
+    仅问答型任务会打印该标记；无标记时不动 interaction_cache，保持原有行为。
+    """
+    answer: str | None = None
+    try:
+        with open(agent_log_path, encoding="utf-8") as f:
+            for line in f:
+                if _ANSWER_MARKER in line:
+                    answer = line.split(_ANSWER_MARKER, 1)[1].strip()
+                    break
+    except OSError:
+        return
+    if not answer:
+        return
+    try:
+        env.execute_action(JSONAction(action_type="answer", text=answer))
+        print(f"[answer] {answer!r} 已回传 MobileWorld", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001
+        print(f"[answer] 回传失败: {e}", file=sys.stderr)
+
+
 def run_one_task(target: tuple[str, int], task_name: str, args: argparse.Namespace) -> dict:
     backend_url, adb_port = target
     agent_main = os.path.join(args.agent_dir, "main.py")
@@ -98,18 +126,41 @@ def run_one_task(target: tuple[str, int], task_name: str, args: argparse.Namespa
             cmd = [args.agent_python, agent_main] + agent_argv
             cwd = args.agent_dir
         agent_exit: int | str | None
+        # agent 子进程 stdout/stderr 落盘到 <log_dir>/agent_logs/<task>-<port>.log，
+        # 配合 cli.py --mw-goal 里的 logging.basicConfig(INFO)，把 planner 每一步
+        # （Agent 文本 / Tool 调用 / 结果）都持久化，供赛后排查"agent 到底做了什么"。
+        agent_log_dir = os.path.join(args.log_dir, "agent_logs")
+        os.makedirs(agent_log_dir, exist_ok=True)
+        agent_log_path = os.path.join(agent_log_dir, f"{task_name}-{adb_port}.log")
         try:
-            proc = subprocess.run(
-                cmd,
-                cwd=cwd,
-                env=build_agent_env(adb_port),
-                timeout=args.agent_timeout,
-                check=False,
-            )
+            with open(agent_log_path, "w", encoding="utf-8") as agent_log:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=cwd,
+                    env=build_agent_env(
+                        adb_port,
+                        overrides={
+                            # 每个任务一份 midscene HTML 报告，落到 log_dir 下持久保存
+                            "MIDSCENE_REPORT_OUTPUT_DIR": (
+                                f"{args.log_dir}/midscene_reports/{task_name}-{adb_port}"
+                            ),
+                            # 打开/关闭模型 thinking 模式（非 Claude/gpt/gemini 模型）
+                            "MICAR_THINKING_MODE": (
+                                "enabled" if args.thinking else "disabled"
+                            ),
+                        },
+                    ),
+                    stdout=agent_log,
+                    stderr=subprocess.STDOUT,
+                    timeout=args.agent_timeout,
+                    check=False,
+                )
             agent_exit = proc.returncode
         except subprocess.TimeoutExpired:
             print(f"[timeout] agent exceeded {args.agent_timeout}s on {task_name}", file=sys.stderr)
             agent_exit = "timeout"
+        # ANSWER 型任务：agent 结束前打印 MOBILEWORLD_ANSWER，这里回传后端再打分
+        _submit_answer(env, agent_log_path)
         score, reason = env.get_task_score(task_name)
         return {
             "task": task_name,
@@ -141,14 +192,32 @@ def run_one_task(target: tuple[str, int], task_name: str, args: argparse.Namespa
                 pass
 
 
-def run_target_group(
-    target: tuple[str, int], task_names: list[str], args: argparse.Namespace
-) -> list[dict]:
-    """串行跑同一容器上的全部任务（同一 env 不可并发），返回结果行列表。
+_DONE = object()  # 结果队列哨兵：标记某一容器整组任务结束
 
-    不写 jsonlines —— 写文件只能发生在主线程。
+
+def run_target_group(
+    target: tuple[str, int],
+    task_names: list[str],
+    args: argparse.Namespace,
+    result_q: queue.Queue,
+) -> None:
+    """串行跑同一容器上的全部任务（同一 env 不可并发），逐题把结果投递到队列。
+
+    不在此写 jsonlines / result.txt —— 结果经 result_q 交给主线程流式落盘（含 flush）。
     """
-    return [run_one_task(target, name, args) for name in task_names]
+    try:
+        for name in task_names:
+            result_q.put(run_one_task(target, name, args))
+    finally:
+        result_q.put(_DONE)  # 即使中途异常也投递哨兵，避免主线程阻塞
+
+
+def _write_result_txt(log_dir: str, r: dict) -> None:
+    """每题单独落 result.txt，对齐官方 TrajLogger 布局（score/reason 两行）。"""
+    task_dir = os.path.join(log_dir, r["task"])
+    os.makedirs(task_dir, exist_ok=True)
+    with open(os.path.join(task_dir, "result.txt"), "w", encoding="utf-8") as f:
+        f.write(f"score: {r['score']}\nreason: {r['reason']}")
 
 
 def main() -> int:
@@ -158,6 +227,11 @@ def main() -> int:
     ap.add_argument("--model", default="xiaomi/mimo-v2.6-flash", help="规划模型")
     ap.add_argument("--max-turns", type=int, default=30)
     ap.add_argument("--agent-timeout", type=int, default=900, help="单个 agent 子进程超时（秒）")
+    ap.add_argument(
+        "--thinking",
+        action="store_true",
+        help="打开模型 thinking 模式（经 MICAR_THINKING_MODE=enabled 传给 agent，非 Claude/gpt/gemini 模型生效）",
+    )
     ap.add_argument("--agent-dir", default=AGENT_DIR, help="agent 代码目录（含 main.py）")
     ap.add_argument(
         "--agent-python",
@@ -201,16 +275,34 @@ def main() -> int:
     out_path = f"{args.log_dir}/results.jsonl"
 
     # 按目标分组：同一容器内任务串行（一个 worker），跨容器并行；
-    # worker 只返回结果行，jsonlines 写入仅发生在主线程。
+    # worker 逐题把结果投递到 result_q，主线程边收边落盘：
+    #   - results.jsonl 每题 writer.write + flush（实时可见，崩溃不丢已完成部分）
+    #   - 每题单独写 <log_dir>/<task>/result.txt（对齐官方布局，供 scan/bundle 使用）
+    result_q: queue.Queue = queue.Queue()
     results: list[dict] = []
-    with jsonlines.open(out_path, mode="w") as writer:
-        max_workers = min(args.concurrency, len(task_groups))
+    num_groups = len(task_groups)
+    # jsonlines.Writer 无公开 flush（只有 write/close），改用底层文件对象以便每题立即落盘
+    with open(out_path, "w", encoding="utf-8") as out_f:
+        writer = jsonlines.Writer(out_f)
+        max_workers = min(args.concurrency, num_groups)
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs = [ex.submit(run_target_group, tgt, names, args) for tgt, names in task_groups.items()]
-            for fut in as_completed(futs):
-                for r in fut.result():
-                    results.append(r)
-                    writer.write(r)
+            futs = [
+                ex.submit(run_target_group, tgt, names, args, result_q)
+                for tgt, names in task_groups.items()
+            ]
+            done_groups = 0
+            while done_groups < num_groups:
+                r = result_q.get()  # 阻塞直到有任务完成
+                if r is _DONE:
+                    done_groups += 1
+                    continue
+                results.append(r)
+                writer.write(r)
+                out_f.flush()  # 每题立即落盘
+                _write_result_txt(args.log_dir, r)
+            # 兜底：把 worker 里未捕获的异常在主线程抛出来（正常不会触发，run_one_task 已兜底）
+            for fut in futs:
+                fut.result()
 
     ok = sum(1 for r in results if r["success"])
     print(f"\n== 完成 {len(results)} 题，成功 {ok}，失败 {len(results) - ok} ==")
