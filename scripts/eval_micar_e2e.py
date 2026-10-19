@@ -56,7 +56,7 @@ def wake_and_keep_awake(adb_port: int) -> None:
     serial = f"localhost:{adb_port}"
     cmds = (
         ["shell", "input", "keyevent", "224"],  # KEYCODE_WAKEUP
-        ["shell", "input", "keyevent", "82"],    # KEYCODE_MENU（解锁）
+        ["shell", "input", "keyevent", "4"],     # KEYCODE_BACK（锁屏时解滑动锁；已解锁时 no-op，避免 MENU 弹桌面菜单）
         ["shell", "settings", "put", "system", "screen_off_timeout", "2147483647"],
         ["shell", "svc", "power", "stayon", "true"],
     )
